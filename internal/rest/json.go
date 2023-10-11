@@ -19,3 +19,14 @@ func SaveJSONUnpacked(ctx context.Context, repo SaverUnpacked, t FileType, item 
 
 	return repo.SaveUnpacked(ctx, t, plaintext)
 }
+
+// LoadJSONUnpacked decrypts the data and afterwards calls json.Unmarshal on
+// the item.
+func LoadJSONUnpacked(ctx context.Context, repo LoaderUnpacked, t FileType, id ID, item interface{}) (err error) {
+	buf, err := repo.LoadUnpacked(ctx, t, id)
+	if err != nil {
+		return err
+	}
+
+	return json.Unmarshal(buf, item)
+}

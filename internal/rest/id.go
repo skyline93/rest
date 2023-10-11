@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 )
 
@@ -12,6 +13,23 @@ const idSize = sha256.Size
 
 // ID references content within a repository.
 type ID [idSize]byte
+
+// ParseID converts the given string to an ID.
+func ParseID(s string) (ID, error) {
+	if len(s) != hex.EncodedLen(idSize) {
+		return ID{}, fmt.Errorf("invalid length for ID: %q", s)
+	}
+
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return ID{}, fmt.Errorf("invalid ID: %s", err)
+	}
+
+	id := ID{}
+	copy(id[:], b)
+
+	return id, nil
+}
 
 // NewRandomID returns a randomly generated ID. When reading from rand fails,
 // the function panics.
@@ -26,6 +44,18 @@ func NewRandomID() ID {
 
 func (id ID) String() string {
 	return hex.EncodeToString(id[:])
+}
+
+// IsNull returns true iff id only consists of null bytes.
+func (id ID) IsNull() bool {
+	var nullID ID
+
+	return id == nullID
+}
+
+// Equal compares an ID to another other.
+func (id ID) Equal(other ID) bool {
+	return id == other
 }
 
 // Hash returns the ID for data.

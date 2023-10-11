@@ -1,9 +1,11 @@
 package repository
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 
@@ -211,4 +213,143 @@ func (r *Repository) getZstdEncoder() *zstd.Encoder {
 		r.enc = enc
 	})
 	return r.enc
+}
+
+// Backend returns the backend for the repository.
+func (r *Repository) Backend() rest.Backend {
+	return r.be
+}
+
+// List runs fn for all files of type t in the repo.
+func (r *Repository) List(ctx context.Context, t rest.FileType, fn func(rest.ID, int64) error) error {
+	return r.be.List(ctx, t, func(fi rest.FileInfo) error {
+		id, err := rest.ParseID(fi.Name)
+		if err != nil {
+			log.Printf("unable to parse %v as an ID", fi.Name)
+			return nil
+		}
+		return fn(id, fi.Size)
+	})
+}
+
+// SearchKey finds a key with the supplied password, afterwards the config is
+// read and parsed. It tries at most maxKeys key files in the repo.
+func (r *Repository) SearchKey(ctx context.Context, password string, maxKeys int, keyHint string) error {
+	key, err := SearchKey(ctx, r, password, maxKeys, keyHint)
+	if err != nil {
+		return err
+	}
+
+	r.key = key.master
+	r.keyID = key.ID()
+	cfg, err := rest.LoadConfig(ctx, r)
+	if err == crypto.ErrUnauthenticated {
+		return fmt.Errorf("config or key %v is damaged: %w", key.ID(), err)
+	} else if err != nil {
+		return fmt.Errorf("config cannot be loaded: %w", err)
+	}
+
+	r.setConfig(cfg)
+	return nil
+}
+
+// LoadUnpacked loads and decrypts the file with the given type and ID.
+func (r *Repository) LoadUnpacked(ctx context.Context, t rest.FileType, id rest.ID) ([]byte, error) {
+	log.Printf("load %v with id %v", t, id)
+
+	if t == rest.ConfigFile {
+		id = rest.ID{}
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	h := rest.Handle{Type: t, Name: id.String()}
+	retriedInvalidData := false
+	var dataErr error
+	wr := new(bytes.Buffer)
+
+	err := r.be.Load(ctx, h, 0, 0, func(rd io.Reader) error {
+		// make sure this call is idempotent, in case an error occurs
+		wr.Reset()
+		_, cerr := io.Copy(wr, rd)
+		if cerr != nil {
+			return cerr
+		}
+
+		buf := wr.Bytes()
+		if t != rest.ConfigFile && !rest.Hash(buf).Equal(id) {
+			log.Printf("retry loading broken blob %v", h)
+			if !retriedInvalidData {
+				retriedInvalidData = true
+			} else {
+				// with a canceled context there is not guarantee which error will
+				// be returned by `be.Load`.
+				dataErr = fmt.Errorf("load(%v): %w", h, rest.ErrInvalidData)
+				cancel()
+			}
+			return rest.ErrInvalidData
+
+		}
+		return nil
+	})
+
+	if dataErr != nil {
+		return nil, dataErr
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	buf := wr.Bytes()
+	nonce, ciphertext := buf[:r.key.NonceSize()], buf[r.key.NonceSize():]
+	plaintext, err := r.key.Open(ciphertext[:0], nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+	if t != rest.ConfigFile {
+		return r.decompressUnpacked(plaintext)
+	}
+
+	return plaintext, nil
+}
+
+func (r *Repository) decompressUnpacked(p []byte) ([]byte, error) {
+	// compression is only available starting from version 2
+	if r.cfg.Version < 2 {
+		return p, nil
+	}
+
+	if len(p) == 0 {
+		// too short for version header
+		return p, nil
+	}
+	if p[0] == '[' || p[0] == '{' {
+		// probably raw JSON
+		return p, nil
+	}
+	// version
+	if p[0] != 2 {
+		return nil, errors.New("not supported encoding format")
+	}
+
+	return r.getZstdDecoder().DecodeAll(p[1:], nil)
+}
+
+func (r *Repository) getZstdDecoder() *zstd.Decoder {
+	r.allocDec.Do(func() {
+		opts := []zstd.DOption{
+			// Use all available cores.
+			zstd.WithDecoderConcurrency(0),
+			// Limit the maximum decompressed memory. Set to a very high,
+			// conservative value.
+			zstd.WithDecoderMaxMemory(16 * 1024 * 1024 * 1024),
+		}
+
+		dec, err := zstd.NewReader(nil, opts...)
+		if err != nil {
+			panic(err)
+		}
+		r.dec = dec
+	})
+	return r.dec
 }

@@ -45,6 +45,12 @@ func open(ctx context.Context, cfg Config) (*Local, error) {
 	}, nil
 }
 
+// Open opens the local backend as specified by config.
+func Open(ctx context.Context, cfg Config) (*Local, error) {
+	log.Printf("open local backend at %v (layout %q)", cfg.Path, cfg.Layout)
+	return open(ctx, cfg)
+}
+
 // Create creates all the necessary files and directories for a new local
 // backend at dir. Afterwards a new config blob should be created.
 func Create(ctx context.Context, cfg Config) (*Local, error) {

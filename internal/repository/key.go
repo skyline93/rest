@@ -9,8 +9,17 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/skyline93/rest/internal/backend"
 	"github.com/skyline93/rest/internal/crypto"
 	"github.com/skyline93/rest/internal/rest"
+)
+
+var (
+	// ErrNoKeyFound is returned when no key for the repository could be decrypted.
+	ErrNoKeyFound = errors.New("wrong password or no key found")
+
+	// ErrMaxKeysReached is returned when the maximum number of keys was checked and no key could be found.
+	ErrMaxKeysReached = errors.New("maximum number of keys reached")
 )
 
 // Key represents an encrypted master key for a repository.
@@ -48,6 +57,23 @@ var (
 // it with the password.
 func createMasterKey(ctx context.Context, s *Repository, password string) (*Key, error) {
 	return AddKey(ctx, s, password, "", "", nil)
+}
+
+// LoadKey loads a key from the backend.
+func LoadKey(ctx context.Context, s *Repository, id rest.ID) (k *Key, err error) {
+	h := rest.Handle{Type: rest.KeyFile, Name: id.String()}
+	data, err := backend.LoadAll(ctx, nil, s.be, h)
+	if err != nil {
+		return nil, err
+	}
+
+	k = &Key{}
+	err = json.Unmarshal(data, k)
+	if err != nil {
+		return nil, errors.Wrap(err, "Unmarshal")
+	}
+
+	return k, nil
 }
 
 // AddKey adds a new key to an already existing repository.
@@ -145,4 +171,124 @@ func AddKey(ctx context.Context, s *Repository, password, username, hostname str
 // ID returns an identifier for the key.
 func (k Key) ID() rest.ID {
 	return k.id
+}
+
+// Valid tests whether the mac and encryption keys are valid (i.e. not zero)
+func (k *Key) Valid() bool {
+	return k.user.Valid() && k.master.Valid()
+}
+
+// OpenKey tries do decrypt the key specified by name with the given password.
+func OpenKey(ctx context.Context, s *Repository, id rest.ID, password string) (*Key, error) {
+	k, err := LoadKey(ctx, s, id)
+	if err != nil {
+		log.Printf("LoadKey(%v) returned error %v", id.String(), err)
+		return nil, err
+	}
+
+	// check KDF
+	if k.KDF != "scrypt" {
+		return nil, errors.New("only supported KDF is scrypt()")
+	}
+
+	// derive user key
+	params := crypto.Params{
+		N: k.N,
+		R: k.R,
+		P: k.P,
+	}
+	k.user, err = crypto.KDF(params, k.Salt, password)
+	if err != nil {
+		return nil, errors.Wrap(err, "crypto.KDF")
+	}
+
+	// decrypt master keys
+	nonce, ciphertext := k.Data[:k.user.NonceSize()], k.Data[k.user.NonceSize():]
+	buf, err := k.user.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// restore json
+	k.master = &crypto.Key{}
+	err = json.Unmarshal(buf, k.master)
+	if err != nil {
+		log.Printf("Unmarshal() returned error %v", err)
+		return nil, errors.Wrap(err, "Unmarshal")
+	}
+	k.id = id
+
+	if !k.Valid() {
+		return nil, errors.New("Invalid key for repository")
+	}
+
+	return k, nil
+}
+
+// SearchKey tries to decrypt at most maxKeys keys in the backend with the
+// given password. If none could be found, ErrNoKeyFound is returned. When
+// maxKeys is reached, ErrMaxKeysReached is returned. When setting maxKeys to
+// zero, all keys in the repo are checked.
+func SearchKey(ctx context.Context, s *Repository, password string, maxKeys int, keyHint string) (k *Key, err error) {
+	checked := 0
+
+	if len(keyHint) > 0 {
+		id, err := rest.Find(ctx, s.Backend(), rest.KeyFile, keyHint)
+
+		if err == nil {
+			key, err := OpenKey(ctx, s, id, password)
+
+			if err == nil {
+				log.Printf("successfully opened hinted key %v", id)
+				return key, nil
+			}
+
+			log.Printf("could not open hinted key %v", id)
+		} else {
+			log.Printf("Could not find hinted key %v", keyHint)
+		}
+	}
+
+	listCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// try at most maxKeys keys in repo
+	err = s.List(listCtx, rest.KeyFile, func(id rest.ID, size int64) error {
+		checked++
+		if maxKeys > 0 && checked > maxKeys {
+			return ErrMaxKeysReached
+		}
+
+		log.Printf("trying key %q", id.String())
+		key, err := OpenKey(ctx, s, id, password)
+		if err != nil {
+			log.Printf("key %v returned error %v", id.String(), err)
+
+			// ErrUnauthenticated means the password is wrong, try the next key
+			if errors.Is(err, crypto.ErrUnauthenticated) {
+				return nil
+			}
+
+			return err
+		}
+
+		log.Printf("successfully opened key %v", id.String())
+		k = key
+		cancel()
+		return nil
+	})
+
+	if err == context.Canceled {
+		err = nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if k == nil {
+		return nil, ErrNoKeyFound
+	}
+
+	return k, nil
 }

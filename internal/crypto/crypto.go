@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"fmt"
 
+	"github.com/pkg/errors"
 	"golang.org/x/crypto/poly1305"
 )
 
@@ -39,6 +40,11 @@ const (
 
 	// Extension is the number of bytes a plaintext is enlarged by encrypting it.
 	Extension = ivSize + macSize
+)
+
+var (
+	// ErrUnauthenticated is returned when ciphertext verification has failed.
+	ErrUnauthenticated = errors.New("ciphertext verification failed")
 )
 
 // construct mac key from slice (k||r), with masking
@@ -159,6 +165,62 @@ func (k *Key) Valid() bool {
 	return k.EncryptionKey.Valid() && k.MACKey.Valid()
 }
 
+// NonceSize returns the size of the nonce that must be passed to Seal
+// and Open.
+func (k *Key) NonceSize() int {
+	return ivSize
+}
+
+// Open decrypts and authenticates ciphertext, authenticates the
+// additional data and, if successful, appends the resulting plaintext
+// to dst, returning the updated slice. The nonce must be NonceSize()
+// bytes long and both it and the additional data must match the
+// value passed to Seal.
+//
+// The ciphertext and dst may alias exactly or not at all. To reuse
+// ciphertext's storage for the decrypted output, use ciphertext[:0] as dst.
+//
+// Even if the function fails, the contents of dst, up to its capacity,
+// may be overwritten.
+func (k *Key) Open(dst, nonce, ciphertext, _ []byte) ([]byte, error) {
+	if !k.Valid() {
+		return nil, errors.New("invalid key")
+	}
+
+	// check parameters
+	if len(nonce) != ivSize {
+		panic("incorrect nonce length")
+	}
+
+	if !validNonce(nonce) {
+		return nil, errors.New("nonce is invalid")
+	}
+
+	// check for plausible length
+	if len(ciphertext) < k.Overhead() {
+		return nil, errors.Errorf("trying to decrypt invalid data: ciphertext too small")
+	}
+
+	l := len(ciphertext) - macSize
+	ct, mac := ciphertext[:l], ciphertext[l:]
+
+	// verify mac
+	if !poly1305Verify(ct, nonce, &k.MACKey, mac) {
+		return nil, ErrUnauthenticated
+	}
+
+	ret, out := sliceForAppend(dst, len(ct))
+
+	c, err := aes.NewCipher(k.EncryptionKey[:])
+	if err != nil {
+		panic(fmt.Sprintf("unable to create cipher: %v", err))
+	}
+	e := cipher.NewCTR(c, nonce)
+	e.XORKeyStream(out, ct)
+
+	return ret, nil
+}
+
 // Valid tests whether the key k is valid (i.e. not zero).
 func (k *EncryptionKey) Valid() bool {
 	for i := 0; i < len(k); i++ {
@@ -226,6 +288,15 @@ func poly1305PrepareKey(nonce []byte, key *MACKey) [32]byte {
 	copy(k[:16], key.R[:])
 
 	return k
+}
+
+func poly1305Verify(msg []byte, nonce []byte, key *MACKey, mac []byte) bool {
+	k := poly1305PrepareKey(nonce, key)
+
+	var m [16]byte
+	copy(m[:], mac)
+
+	return poly1305.Verify(&m, msg, &k)
 }
 
 // Valid tests whether the key k is valid (i.e. not zero).

@@ -42,3 +42,29 @@ func SaveConfig(ctx context.Context, r SaverUnpacked, cfg Config) error {
 	_, err := SaveJSONUnpacked(ctx, r, ConfigFile, cfg)
 	return err
 }
+
+var checkPolynomial = true
+
+// LoadConfig returns loads, checks and returns the config for a repository.
+func LoadConfig(ctx context.Context, r LoaderUnpacked) (Config, error) {
+	var (
+		cfg Config
+	)
+
+	err := LoadJSONUnpacked(ctx, r, ConfigFile, ID{}, &cfg)
+	if err != nil {
+		return Config{}, err
+	}
+
+	if cfg.Version < MinRepoVersion || cfg.Version > MaxRepoVersion {
+		return Config{}, errors.Errorf("unsupported repository version %v", cfg.Version)
+	}
+
+	if checkPolynomial {
+		if !cfg.ChunkerPolynomial.Irreducible() {
+			return Config{}, errors.New("invalid chunker polynomial")
+		}
+	}
+
+	return cfg, nil
+}
