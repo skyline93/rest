@@ -19,6 +19,9 @@ github.com/klauspost/compress/zstd/internal/xxhash
 # github.com/pkg/errors v0.9.1
 ## explicit
 github.com/pkg/errors
+# github.com/pkg/xattr v0.4.9
+## explicit; go 1.14
+github.com/pkg/xattr
 # github.com/restic/chunker v0.4.0
 ## explicit; go 1.9
 github.com/restic/chunker
@@ -41,8 +44,3 @@ golang.org/x/sync/errgroup
 ## explicit; go 1.17
 golang.org/x/sys/cpu
 golang.org/x/sys/unix
-# honnef.co/go/tools v0.4.6
-## explicit; go 1.19
-honnef.co/go/tools/internal/renameio
-honnef.co/go/tools/internal/robustio
-honnef.co/go/tools/lintcmd/cache

@@ -42,3 +42,39 @@ func Remove(name string) error {
 func RemoveAll(path string) error {
 	return os.RemoveAll(fixpath(path))
 }
+
+// RemoveIfExists removes a file, returning no error if it does not exist.
+func RemoveIfExists(filename string) error {
+	err := os.Remove(filename)
+	if err != nil && os.IsNotExist(err) {
+		err = nil
+	}
+	return err
+}
+
+// Mkdir creates a new directory with the specified name and permission bits.
+// If there is an error, it will be of type *PathError.
+func Mkdir(name string, perm os.FileMode) error {
+	return os.Mkdir(fixpath(name), perm)
+}
+
+// OpenFile is the generalized open call; most users will use Open
+// or Create instead.  It opens the named file with specified flag
+// (O_RDONLY etc.) and perm, (0666 etc.) if applicable.  If successful,
+// methods on the returned File can be used for I/O.
+// If there is an error, it will be of type *PathError.
+func OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
+	return os.OpenFile(fixpath(name), flag, perm)
+}
+
+// Symlink creates newname as a symbolic link to oldname.
+// If there is an error, it will be of type *LinkError.
+func Symlink(oldname, newname string) error {
+	return os.Symlink(oldname, fixpath(newname))
+}
+
+// Readlink returns the destination of the named symbolic link.
+// If there is an error, it will be of type *PathError.
+func Readlink(name string) (string, error) {
+	return os.Readlink(fixpath(name))
+}

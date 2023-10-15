@@ -2,6 +2,7 @@ package rest
 
 import (
 	"bytes"
+	"github.com/pkg/errors"
 	"hash"
 	"io"
 )
@@ -62,4 +63,48 @@ func (b *ByteReader) Length() int64 {
 // Hash return a hash of the data if requested by the backed.
 func (b *ByteReader) Hash() []byte {
 	return b.hash
+}
+
+// FileReader implements a RewindReader for an open file.
+type FileReader struct {
+	io.ReadSeeker
+	Len  int64
+	hash []byte
+}
+
+// Rewind seeks to the beginning of the file.
+func (f *FileReader) Rewind() error {
+	_, err := f.ReadSeeker.Seek(0, io.SeekStart)
+	return errors.Wrap(err, "Seek")
+}
+
+// Length returns the length of the file.
+func (f *FileReader) Length() int64 {
+	return f.Len
+}
+
+// Hash return a hash of the data if requested by the backed.
+func (f *FileReader) Hash() []byte {
+	return f.hash
+}
+
+// NewFileReader wraps f in a *FileReader.
+func NewFileReader(f io.ReadSeeker, hash []byte) (*FileReader, error) {
+	pos, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, errors.Wrap(err, "Seek")
+	}
+
+	fr := &FileReader{
+		ReadSeeker: f,
+		Len:        pos,
+		hash:       hash,
+	}
+
+	err = fr.Rewind()
+	if err != nil {
+		return nil, err
+	}
+
+	return fr, nil
 }

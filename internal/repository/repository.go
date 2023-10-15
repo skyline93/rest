@@ -3,19 +3,23 @@ package repository
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
+	"github.com/pkg/errors"
 	"io"
 	"log"
+	"os"
+	"runtime"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/restic/chunker"
+	"github.com/skyline93/rest/internal/backend"
+	"github.com/skyline93/rest/internal/cache"
 	"github.com/skyline93/rest/internal/crypto"
 	"github.com/skyline93/rest/internal/index"
+	"github.com/skyline93/rest/internal/pack"
 	"github.com/skyline93/rest/internal/rest"
 	"golang.org/x/sync/errgroup"
-	"honnef.co/go/tools/lintcmd/cache"
 )
 
 const MinPackSize = 4 * 1024 * 1024
@@ -352,4 +356,370 @@ func (r *Repository) getZstdDecoder() *zstd.Decoder {
 		r.dec = dec
 	})
 	return r.dec
+}
+
+// Key returns the current master key.
+func (r *Repository) Key() *crypto.Key {
+	return r.key
+}
+
+// Index returns the currently used MasterIndex.
+func (r *Repository) Index() rest.MasterIndex {
+	return r.idx
+}
+
+// SetIndex instructs the repository to use the given index.
+func (r *Repository) SetIndex(i rest.MasterIndex) error {
+	r.idx = i.(*index.MasterIndex)
+	return r.prepareCache()
+}
+
+// LoadIndex loads all index files from the backend in parallel and stores them
+// in the master index. The first error that occurred is returned.
+func (r *Repository) LoadIndex(ctx context.Context) error {
+	log.Println("Loading index")
+
+	err := index.ForAllIndexes(ctx, r, func(id rest.ID, idx *index.Index, oldFormat bool, err error) error {
+		if err != nil {
+			return err
+		}
+		r.idx.Insert(idx)
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	err = r.idx.MergeFinalIndexes()
+	if err != nil {
+		return err
+	}
+
+	// Trigger GC to reset garbage collection threshold
+	runtime.GC()
+
+	if r.cfg.Version < 2 {
+		// sanity check
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		invalidIndex := false
+		r.idx.Each(ctx, func(blob rest.PackedBlob) {
+			if blob.IsCompressed() {
+				invalidIndex = true
+			}
+		})
+		if invalidIndex {
+			return errors.New("index uses feature not supported by repository version 1")
+		}
+	}
+
+	// remove index files from the cache which have been removed in the repo
+	return r.prepareCache()
+}
+
+// prepareCache initializes the local cache. indexIDs is the list of IDs of
+// index files still present in the repo.
+func (r *Repository) prepareCache() error {
+	if r.Cache == nil {
+		return nil
+	}
+
+	indexIDs := r.idx.IDs()
+	log.Printf("prepare cache with %d index files", len(indexIDs))
+
+	// clear old index files
+	err := r.Cache.Clear(rest.IndexFile, indexIDs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error clearing index files in cache: %v\n", err)
+	}
+
+	packs := r.idx.Packs(rest.NewIDSet())
+
+	// clear old packs
+	err = r.Cache.Clear(rest.PackFile, packs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error clearing pack files in cache: %v\n", err)
+	}
+
+	return nil
+}
+
+// LookupBlobSize returns the size of blob id.
+func (r *Repository) LookupBlobSize(id rest.ID, tpe rest.BlobType) (uint, bool) {
+	return r.idx.LookupSize(rest.BlobHandle{ID: id, Type: tpe})
+}
+
+// Config returns the repository configuration.
+func (r *Repository) Config() rest.Config {
+	return r.cfg
+}
+
+// PackSize return the target size of a pack file when uploading
+func (r *Repository) PackSize() uint {
+	return r.opts.PackSize
+}
+
+// ListPack returns the list of blobs saved in the pack id and the length of
+// the the pack header.
+func (r *Repository) ListPack(ctx context.Context, id rest.ID, size int64) ([]rest.Blob, uint32, error) {
+	h := rest.Handle{Type: rest.PackFile, Name: id.String()}
+
+	return pack.List(r.Key(), backend.ReaderAt(ctx, r.Backend(), h), size)
+}
+
+var zeroChunkOnce sync.Once
+var zeroChunkID rest.ID
+
+// ZeroChunk computes and returns (cached) the ID of an all-zero chunk with size chunker.MinSize
+func ZeroChunk() rest.ID {
+	zeroChunkOnce.Do(func() {
+		zeroChunkID = rest.Hash(make([]byte, chunker.MinSize))
+	})
+	return zeroChunkID
+}
+
+// SaveBlob saves a blob of type t into the repository.
+// It takes care that no duplicates are saved; this can be overwritten
+// by setting storeDuplicate to true.
+// If id is the null id, it will be computed and returned.
+// Also returns if the blob was already known before.
+// If the blob was not known before, it returns the number of bytes the blob
+// occupies in the repo (compressed or not, including encryption overhead).
+func (r *Repository) SaveBlob(ctx context.Context, t rest.BlobType, buf []byte, id rest.ID, storeDuplicate bool) (newID rest.ID, known bool, size int, err error) {
+
+	// compute plaintext hash if not already set
+	if id.IsNull() {
+		// Special case the hash calculation for all zero chunks. This is especially
+		// useful for sparse files containing large all zero regions. For these we can
+		// process chunks as fast as we can read the from disk.
+		if len(buf) == chunker.MinSize && rest.ZeroPrefixLen(buf) == chunker.MinSize {
+			newID = ZeroChunk()
+		} else {
+			newID = rest.Hash(buf)
+		}
+	} else {
+		newID = id
+	}
+
+	// first try to add to pending blobs; if not successful, this blob is already known
+	known = !r.idx.AddPending(rest.BlobHandle{ID: newID, Type: t})
+
+	// only save when needed or explicitly told
+	if !known || storeDuplicate {
+		size, err = r.saveAndEncrypt(ctx, t, buf, newID)
+	}
+
+	return newID, known, size, err
+}
+
+// LoadBlob loads a blob of type t from the repository.
+// It may use all of buf[:cap(buf)] as scratch space.
+func (r *Repository) LoadBlob(ctx context.Context, t rest.BlobType, id rest.ID, buf []byte) ([]byte, error) {
+	log.Printf("load %v with id %v (buf len %v, cap %d)", t, id, len(buf), cap(buf))
+
+	// lookup packs
+	blobs := r.idx.Lookup(rest.BlobHandle{ID: id, Type: t})
+	if len(blobs) == 0 {
+		log.Printf("id %v not found in index", id)
+		return nil, errors.Errorf("id %v not found in repository", id)
+	}
+
+	// try cached pack files first
+	sortCachedPacksFirst(r.Cache, blobs)
+
+	var lastError error
+	for _, blob := range blobs {
+		log.Printf("blob %v/%v found: %v", t, id, blob)
+
+		if blob.Type != t {
+			log.Printf("blob %v has wrong block type, want %v", blob, t)
+		}
+
+		// load blob from pack
+		h := rest.Handle{Type: rest.PackFile, Name: blob.PackID.String(), ContainedBlobType: t}
+
+		switch {
+		case cap(buf) < int(blob.Length):
+			buf = make([]byte, blob.Length)
+		case len(buf) != int(blob.Length):
+			buf = buf[:blob.Length]
+		}
+
+		n, err := backend.ReadAt(ctx, r.be, h, int64(blob.Offset), buf)
+		if err != nil {
+			log.Printf("error loading blob %v: %v", blob, err)
+			lastError = err
+			continue
+		}
+
+		if uint(n) != blob.Length {
+			lastError = errors.Errorf("error loading blob %v: wrong length returned, want %d, got %d",
+				id.Str(), blob.Length, uint(n))
+			log.Printf("lastError: %v", lastError)
+			continue
+		}
+
+		// decrypt
+		nonce, ciphertext := buf[:r.key.NonceSize()], buf[r.key.NonceSize():]
+		plaintext, err := r.key.Open(ciphertext[:0], nonce, ciphertext, nil)
+		if err != nil {
+			lastError = errors.Errorf("decrypting blob %v failed: %v", id, err)
+			continue
+		}
+
+		if blob.IsCompressed() {
+			plaintext, err = r.getZstdDecoder().DecodeAll(plaintext, make([]byte, 0, blob.DataLength()))
+			if err != nil {
+				lastError = errors.Errorf("decompressing blob %v failed: %v", id, err)
+				continue
+			}
+		}
+
+		// check hash
+		if !rest.Hash(plaintext).Equal(id) {
+			lastError = errors.Errorf("blob %v returned invalid hash", id)
+			continue
+		}
+
+		if len(plaintext) > cap(buf) {
+			return plaintext, nil
+		}
+		// move decrypted data to the start of the buffer
+		buf = buf[:len(plaintext)]
+		copy(buf, plaintext)
+		return buf, nil
+	}
+
+	if lastError != nil {
+		return nil, lastError
+	}
+
+	return nil, errors.Errorf("loading blob %v from %v packs failed", id.Str(), len(blobs))
+}
+
+// Flush saves all remaining packs and the index
+func (r *Repository) Flush(ctx context.Context) error {
+	if err := r.flushPacks(ctx); err != nil {
+		return err
+	}
+
+	// Save index after flushing only if noAutoIndexUpdate is not set
+	if r.noAutoIndexUpdate {
+		return nil
+	}
+	return r.idx.SaveIndex(ctx, r)
+}
+
+func (r *Repository) StartPackUploader(ctx context.Context, wg *errgroup.Group) {
+	if r.packerWg != nil {
+		panic("uploader already started")
+	}
+
+	innerWg, ctx := errgroup.WithContext(ctx)
+	r.packerWg = innerWg
+	r.uploader = newPackerUploader(ctx, innerWg, r, r.be.Connections())
+	r.treePM = newPackerManager(r.key, rest.TreeBlob, r.PackSize(), r.uploader.QueuePacker)
+	r.dataPM = newPackerManager(r.key, rest.DataBlob, r.PackSize(), r.uploader.QueuePacker)
+
+	wg.Go(func() error {
+		return innerWg.Wait()
+	})
+}
+
+// saveAndEncrypt encrypts data and stores it to the backend as type t. If data
+// is small enough, it will be packed together with other small blobs. The
+// caller must ensure that the id matches the data. Returned is the size data
+// occupies in the repo (compressed or not, including the encryption overhead).
+func (r *Repository) saveAndEncrypt(ctx context.Context, t rest.BlobType, data []byte, id rest.ID) (size int, err error) {
+	log.Printf("save id %v (%v, %d bytes)", id, t, len(data))
+
+	uncompressedLength := 0
+	if r.cfg.Version > 1 {
+
+		// we have a repo v2, so compression is available. if the user opts to
+		// not compress, we won't compress any data, but everything else is
+		// compressed.
+		if r.opts.Compression != CompressionOff || t != rest.DataBlob {
+			uncompressedLength = len(data)
+			data = r.getZstdEncoder().EncodeAll(data, nil)
+		}
+	}
+
+	nonce := crypto.NewRandomNonce()
+
+	ciphertext := make([]byte, 0, crypto.CiphertextLength(len(data)))
+	ciphertext = append(ciphertext, nonce...)
+
+	// encrypt blob
+	ciphertext = r.key.Seal(ciphertext, nonce, data, nil)
+
+	// find suitable packer and add blob
+	var pm *packerManager
+
+	switch t {
+	case rest.TreeBlob:
+		pm = r.treePM
+	case rest.DataBlob:
+		pm = r.dataPM
+	default:
+		panic(fmt.Sprintf("invalid type: %v", t))
+	}
+
+	return pm.SaveBlob(ctx, t, id, ciphertext, uncompressedLength)
+}
+
+type haver interface {
+	Has(rest.Handle) bool
+}
+
+// sortCachedPacksFirst moves all cached pack files to the front of blobs.
+func sortCachedPacksFirst(cache haver, blobs []rest.PackedBlob) {
+	if cache == nil {
+		return
+	}
+
+	// no need to sort a list with one element
+	if len(blobs) == 1 {
+		return
+	}
+
+	cached := blobs[:0]
+	noncached := make([]rest.PackedBlob, 0, len(blobs)/2)
+
+	for _, blob := range blobs {
+		if cache.Has(rest.Handle{Type: rest.PackFile, Name: blob.PackID.String()}) {
+			cached = append(cached, blob)
+			continue
+		}
+		noncached = append(noncached, blob)
+	}
+
+	copy(blobs[len(cached):], noncached)
+}
+
+// FlushPacks saves all remaining packs.
+func (r *Repository) flushPacks(ctx context.Context) error {
+	if r.packerWg == nil {
+		return nil
+	}
+
+	err := r.treePM.Flush(ctx)
+	if err != nil {
+		return err
+	}
+	err = r.dataPM.Flush(ctx)
+	if err != nil {
+		return err
+	}
+	r.uploader.TriggerShutdown()
+	err = r.packerWg.Wait()
+
+	r.treePM = nil
+	r.dataPM = nil
+	r.uploader = nil
+	r.packerWg = nil
+
+	return err
 }

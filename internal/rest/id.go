@@ -42,6 +42,21 @@ func NewRandomID() ID {
 	return id
 }
 
+const shortStr = 4
+
+// Str returns the shortened string version of id.
+func (id *ID) Str() string {
+	if id == nil {
+		return "[nil]"
+	}
+
+	if id.IsNull() {
+		return "[null]"
+	}
+
+	return hex.EncodeToString(id[:shortStr])
+}
+
 func (id ID) String() string {
 	return hex.EncodeToString(id[:])
 }
@@ -61,4 +76,14 @@ func (id ID) Equal(other ID) bool {
 // Hash returns the ID for data.
 func Hash(data []byte) ID {
 	return sha256.Sum256(data)
+}
+
+// IDFromHash returns the ID for the hash.
+func IDFromHash(hash []byte) (id ID) {
+	if len(hash) != idSize {
+		panic("invalid hash type, not enough/too many bytes")
+	}
+
+	copy(id[:], hash)
+	return id
 }

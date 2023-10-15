@@ -70,3 +70,8 @@ func (sn *Snapshot) fillUserInfo() error {
 func SaveSnapshot(ctx context.Context, repo SaverUnpacked, sn *Snapshot) (ID, error) {
 	return SaveJSONUnpacked(ctx, repo, SnapshotFile, sn)
 }
+
+// ID returns the snapshot's ID.
+func (sn Snapshot) ID() *ID {
+	return sn.id
+}

@@ -1,5 +1,7 @@
 package rest
 
+import "github.com/skyline93/rest/internal/crypto"
+
 // BlobHandle identifies a blob of a given type.
 type BlobHandle struct {
 	ID   ID
@@ -20,4 +22,21 @@ type Blob struct {
 	Length             uint
 	Offset             uint
 	UncompressedLength uint
+}
+
+// PackedBlob is a blob stored within a file.
+type PackedBlob struct {
+	Blob
+	PackID ID
+}
+
+func (b Blob) IsCompressed() bool {
+	return b.UncompressedLength != 0
+}
+
+func (b Blob) DataLength() uint {
+	if b.UncompressedLength != 0 {
+		return b.UncompressedLength
+	}
+	return uint(crypto.PlaintextLength(int(b.Length)))
 }
