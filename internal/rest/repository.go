@@ -33,3 +33,15 @@ type SaverUnpacked interface {
 	Connections() uint
 	SaveUnpacked(ctx context.Context, t FileType, buf []byte) (ID, error)
 }
+
+// LoaderUnpacked allows loading a blob not stored in a pack file
+type LoaderUnpacked interface {
+	// Connections returns the maximum number of concurrent backend operations
+	Connections() uint
+	LoadUnpacked(ctx context.Context, t FileType, id ID) (data []byte, err error)
+}
+
+type ListerLoaderUnpacked interface {
+	Lister
+	LoaderUnpacked
+}

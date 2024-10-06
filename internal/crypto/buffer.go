@@ -12,3 +12,8 @@ func NewBlobBuffer(size int) []byte {
 	return make([]byte, size, size+Extension)
 }
 
+// PlaintextLength returns the plaintext length of a blob with ciphertextSize
+// bytes.
+func PlaintextLength(ciphertextSize int) int {
+	return ciphertextSize - Extension
+}

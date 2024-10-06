@@ -21,3 +21,22 @@ type Blob struct {
 	Offset             uint
 	UncompressedLength uint
 }
+
+// PackedBlob is a blob stored within a file.
+type PackedBlob struct {
+	Blob
+	PackID ID
+}
+
+func (t BlobType) IsMetadata() bool {
+	switch t {
+	case TreeBlob:
+		return true
+	default:
+		return false
+	}
+}
+
+func (b Blob) IsCompressed() bool {
+	return b.UncompressedLength != 0
+}

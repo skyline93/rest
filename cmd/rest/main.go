@@ -7,6 +7,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var version = "0.17.1"
+
 // cmdRoot is the base command when no other command has been specified.
 var cmdRoot = &cobra.Command{
 	Use:   "rest",

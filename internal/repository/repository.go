@@ -3,12 +3,15 @@ package repository
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
+	"io"
+	"math"
 	"sync"
 
 	"github.com/skyline93/rest/internal/backend"
+	"github.com/skyline93/rest/internal/backend/cache"
 	"github.com/skyline93/rest/internal/crypto"
+	"github.com/skyline93/rest/internal/errors"
 	"github.com/skyline93/rest/internal/repository/index"
 	"github.com/skyline93/rest/internal/rest"
 
@@ -39,7 +42,7 @@ type Repository struct {
 	key   *crypto.Key
 	keyID rest.ID
 	idx   *index.MasterIndex
-	// Cache *cache.Cache
+	Cache *cache.Cache
 
 	opts Options
 
@@ -301,4 +304,487 @@ func (r *Repository) getZstdDecoder() *zstd.Decoder {
 		r.dec = dec
 	})
 	return r.dec
+}
+
+func (r *Repository) SearchKey(ctx context.Context, password string, maxKeys int, keyHint string) error {
+	key, err := SearchKey(ctx, r, password, maxKeys, keyHint)
+	if err != nil {
+		return err
+	}
+
+	oldKey := r.key
+	oldKeyID := r.keyID
+
+	r.key = key.master
+	r.keyID = key.ID()
+	cfg, err := rest.LoadConfig(ctx, r)
+	if err != nil {
+		r.key = oldKey
+		r.keyID = oldKeyID
+
+		if err == crypto.ErrUnauthenticated {
+			return fmt.Errorf("config or key %v is damaged: %w", key.ID(), err)
+		}
+		return fmt.Errorf("config cannot be loaded: %w", err)
+	}
+
+	r.setConfig(cfg)
+	return nil
+}
+
+// LoadUnpacked loads and decrypts the file with the given type and ID.
+func (r *Repository) LoadUnpacked(ctx context.Context, t rest.FileType, id rest.ID) ([]byte, error) {
+	log.Infof("load %v with id %v", t, id)
+
+	if t == rest.ConfigFile {
+		id = rest.ID{}
+	}
+
+	buf, err := r.LoadRaw(ctx, t, id)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce, ciphertext := buf[:r.key.NonceSize()], buf[r.key.NonceSize():]
+	plaintext, err := r.key.Open(ciphertext[:0], nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+	if t != rest.ConfigFile {
+		return r.decompressUnpacked(plaintext)
+	}
+
+	return plaintext, nil
+}
+
+// Config returns the repository configuration.
+func (r *Repository) Config() rest.Config {
+	return r.cfg
+}
+
+// Flush saves all remaining packs and the index
+func (r *Repository) Flush(ctx context.Context) error {
+	if err := r.flushPacks(ctx); err != nil {
+		return err
+	}
+
+	return r.idx.SaveIndex(ctx, r)
+}
+
+// FlushPacks saves all remaining packs.
+func (r *Repository) flushPacks(ctx context.Context) error {
+	if r.packerWg == nil {
+		return nil
+	}
+
+	err := r.treePM.Flush(ctx)
+	if err != nil {
+		return err
+	}
+	err = r.dataPM.Flush(ctx)
+	if err != nil {
+		return err
+	}
+	r.uploader.TriggerShutdown()
+	err = r.packerWg.Wait()
+
+	r.treePM = nil
+	r.dataPM = nil
+	r.uploader = nil
+	r.packerWg = nil
+
+	return err
+}
+
+func (r *Repository) LookupBlob(tpe rest.BlobType, id rest.ID) []rest.PackedBlob {
+	return r.idx.Lookup(rest.BlobHandle{Type: tpe, ID: id})
+}
+
+type byteReader struct {
+	buf []byte
+}
+
+func newByteReader(buf []byte) *byteReader {
+	return &byteReader{
+		buf: buf,
+	}
+}
+
+func (b *byteReader) Discard(n int) (discarded int, err error) {
+	if len(b.buf) < n {
+		return 0, io.ErrUnexpectedEOF
+	}
+	b.buf = b.buf[n:]
+	return n, nil
+}
+
+func (b *byteReader) ReadFull(n int) (buf []byte, err error) {
+	if len(b.buf) < n {
+		return nil, io.ErrUnexpectedEOF
+	}
+	buf = b.buf[:n]
+	b.buf = b.buf[n:]
+	return buf, nil
+}
+
+func (r *Repository) loadBlob(ctx context.Context, blobs []rest.PackedBlob, buf []byte) ([]byte, error) {
+	var lastError error
+	for _, blob := range blobs {
+		log.Infof("blob %v found: %v", blob.BlobHandle, blob)
+		// load blob from pack
+		h := backend.Handle{Type: rest.PackFile, Name: blob.PackID.String(), IsMetadata: blob.Type.IsMetadata()}
+
+		switch {
+		case cap(buf) < int(blob.Length):
+			buf = make([]byte, blob.Length)
+		case len(buf) != int(blob.Length):
+			buf = buf[:blob.Length]
+		}
+
+		_, err := backend.ReadAt(ctx, r.be, h, int64(blob.Offset), buf)
+		if err != nil {
+			log.Infof("error loading blob %v: %v", blob, err)
+			lastError = err
+			continue
+		}
+
+		it := newPackBlobIterator(blob.PackID, newByteReader(buf), uint(blob.Offset), []rest.Blob{blob.Blob}, r.key, r.getZstdDecoder())
+		pbv, err := it.Next()
+
+		if err == nil {
+			err = pbv.Err
+		}
+		if err != nil {
+			log.Infof("error decoding blob %v: %v", blob, err)
+			lastError = err
+			continue
+		}
+
+		plaintext := pbv.Plaintext
+		if len(plaintext) > cap(buf) {
+			return plaintext, nil
+		}
+		// move decrypted data to the start of the buffer
+		buf = buf[:len(plaintext)]
+		copy(buf, plaintext)
+		return buf, nil
+	}
+
+	if lastError != nil {
+		return nil, lastError
+	}
+
+	return nil, errors.Errorf("loading %v from %v packs failed", blobs[0].BlobHandle, len(blobs))
+}
+
+func newPackBlobIterator(packID rest.ID, rd discardReader, currentOffset uint,
+	blobs []rest.Blob, key *crypto.Key, dec *zstd.Decoder) *packBlobIterator {
+	return &packBlobIterator{
+		packID:        packID,
+		rd:            rd,
+		currentOffset: currentOffset,
+		blobs:         blobs,
+		key:           key,
+		dec:           dec,
+	}
+}
+
+// discardReader allows the PackBlobIterator to perform zero copy
+// reads if the underlying data source is a byte slice.
+type discardReader interface {
+	Discard(n int) (discarded int, err error)
+	// ReadFull reads the next n bytes into a byte slice. The caller must not
+	// retain a reference to the byte. Modifications are only allowed within
+	// the boundaries of the returned slice.
+	ReadFull(n int) (buf []byte, err error)
+}
+
+type packBlobIterator struct {
+	packID        rest.ID
+	rd            discardReader
+	currentOffset uint
+
+	blobs []rest.Blob
+	key   *crypto.Key
+	dec   *zstd.Decoder
+
+	decode []byte
+}
+
+type packBlobValue struct {
+	Handle    rest.BlobHandle
+	Plaintext []byte
+	Err       error
+}
+
+var errPackEOF = errors.New("reached EOF of pack file")
+
+// Next returns the next blob, an error or ErrPackEOF if all blobs were read
+func (b *packBlobIterator) Next() (packBlobValue, error) {
+	if len(b.blobs) == 0 {
+		return packBlobValue{}, errPackEOF
+	}
+
+	entry := b.blobs[0]
+	b.blobs = b.blobs[1:]
+
+	skipBytes := int(entry.Offset - b.currentOffset)
+	if skipBytes < 0 {
+		return packBlobValue{}, fmt.Errorf("overlapping blobs in pack %v", b.packID)
+	}
+
+	_, err := b.rd.Discard(skipBytes)
+	if err != nil {
+		return packBlobValue{}, err
+	}
+	b.currentOffset = entry.Offset
+
+	h := rest.BlobHandle{ID: entry.ID, Type: entry.Type}
+	log.Infof("  process blob %v, skipped %d, %v", h, skipBytes, entry)
+
+	buf, err := b.rd.ReadFull(int(entry.Length))
+	if err != nil {
+		log.Infof("    read error %v", err)
+		return packBlobValue{}, fmt.Errorf("readFull: %w", err)
+	}
+
+	b.currentOffset = entry.Offset + entry.Length
+
+	if int(entry.Length) <= b.key.NonceSize() {
+		log.Infof("%v", b.blobs)
+		return packBlobValue{}, fmt.Errorf("invalid blob length %v", entry)
+	}
+
+	// decryption errors are likely permanent, give the caller a chance to skip them
+	nonce, ciphertext := buf[:b.key.NonceSize()], buf[b.key.NonceSize():]
+	plaintext, err := b.key.Open(ciphertext[:0], nonce, ciphertext, nil)
+	if err != nil {
+		err = fmt.Errorf("decrypting blob %v from %v failed: %w", h, b.packID.Str(), err)
+	}
+	if err == nil && entry.IsCompressed() {
+		// DecodeAll will allocate a slice if it is not large enough since it
+		// knows the decompressed size (because we're using EncodeAll)
+		b.decode, err = b.dec.DecodeAll(plaintext, b.decode[:0])
+		plaintext = b.decode
+		if err != nil {
+			err = fmt.Errorf("decompressing blob %v from %v failed: %w", h, b.packID.Str(), err)
+		}
+	}
+	if err == nil {
+		id := rest.Hash(plaintext)
+		if !id.Equal(entry.ID) {
+			log.Infof("read blob %v/%v from %v: wrong data returned, hash is %v",
+				h.Type, h.ID, b.packID.Str(), id)
+			err = fmt.Errorf("read blob %v from %v: wrong data returned, hash is %v",
+				h, b.packID.Str(), id)
+		}
+	}
+
+	return packBlobValue{entry.BlobHandle, plaintext, err}, nil
+}
+
+// LoadBlob loads a blob of type t from the repository.
+// It may use all of buf[:cap(buf)] as scratch space.
+func (r *Repository) LoadBlob(ctx context.Context, t rest.BlobType, id rest.ID, buf []byte) ([]byte, error) {
+	log.Infof("load %v with id %v (buf len %v, cap %d)", t, id, len(buf), cap(buf))
+
+	// lookup packs
+	blobs := r.idx.Lookup(rest.BlobHandle{ID: id, Type: t})
+	if len(blobs) == 0 {
+		log.Infof("id %v not found in index", id)
+		return nil, errors.Errorf("id %v not found in repository", id)
+	}
+
+	// try cached pack files first
+	sortCachedPacksFirst(r.Cache, blobs)
+
+	buf, err := r.loadBlob(ctx, blobs, buf)
+	if err != nil {
+		if r.Cache != nil {
+			for _, blob := range blobs {
+				h := backend.Handle{Type: rest.PackFile, Name: blob.PackID.String(), IsMetadata: blob.Type.IsMetadata()}
+				// ignore errors as there's not much we can do here
+				_ = r.Cache.Forget(h)
+			}
+		}
+
+		buf, err = r.loadBlob(ctx, blobs, buf)
+	}
+	return buf, err
+}
+
+type haver interface {
+	Has(backend.Handle) bool
+}
+
+// sortCachedPacksFirst moves all cached pack files to the front of blobs.
+func sortCachedPacksFirst(cache haver, blobs []rest.PackedBlob) {
+	if cache == nil {
+		return
+	}
+
+	// no need to sort a list with one element
+	if len(blobs) == 1 {
+		return
+	}
+
+	cached := blobs[:0]
+	noncached := make([]rest.PackedBlob, 0, len(blobs)/2)
+
+	for _, blob := range blobs {
+		if cache.Has(backend.Handle{Type: rest.PackFile, Name: blob.PackID.String()}) {
+			cached = append(cached, blob)
+			continue
+		}
+		noncached = append(noncached, blob)
+	}
+
+	copy(blobs[len(cached):], noncached)
+}
+
+// LookupBlobSize returns the size of blob id.
+func (r *Repository) LookupBlobSize(tpe rest.BlobType, id rest.ID) (uint, bool) {
+	return r.idx.LookupSize(rest.BlobHandle{Type: tpe, ID: id})
+}
+
+// SaveBlob saves a blob of type t into the repository.
+// It takes care that no duplicates are saved; this can be overwritten
+// by setting storeDuplicate to true.
+// If id is the null id, it will be computed and returned.
+// Also returns if the blob was already known before.
+// If the blob was not known before, it returns the number of bytes the blob
+// occupies in the repo (compressed or not, including encryption overhead).
+func (r *Repository) SaveBlob(ctx context.Context, t rest.BlobType, buf []byte, id rest.ID, storeDuplicate bool) (newID rest.ID, known bool, size int, err error) {
+
+	if int64(len(buf)) > math.MaxUint32 {
+		return rest.ID{}, false, 0, fmt.Errorf("blob is larger than 4GB")
+	}
+
+	// compute plaintext hash if not already set
+	if id.IsNull() {
+		// Special case the hash calculation for all zero chunks. This is especially
+		// useful for sparse files containing large all zero regions. For these we can
+		// process chunks as fast as we can read the from disk.
+		if len(buf) == chunker.MinSize && rest.ZeroPrefixLen(buf) == chunker.MinSize {
+			newID = ZeroChunk()
+		} else {
+			newID = rest.Hash(buf)
+		}
+	} else {
+		newID = id
+	}
+
+	// first try to add to pending blobs; if not successful, this blob is already known
+	known = !r.idx.AddPending(rest.BlobHandle{ID: newID, Type: t})
+
+	// only save when needed or explicitly told
+	if !known || storeDuplicate {
+		size, err = r.saveAndEncrypt(ctx, t, buf, newID)
+	}
+
+	return newID, known, size, err
+}
+
+var zeroChunkOnce sync.Once
+var zeroChunkID rest.ID
+
+// ZeroChunk computes and returns (cached) the ID of an all-zero chunk with size chunker.MinSize
+func ZeroChunk() rest.ID {
+	zeroChunkOnce.Do(func() {
+		zeroChunkID = rest.Hash(make([]byte, chunker.MinSize))
+	})
+	return zeroChunkID
+}
+
+// saveAndEncrypt encrypts data and stores it to the backend as type t. If data
+// is small enough, it will be packed together with other small blobs. The
+// caller must ensure that the id matches the data. Returned is the size data
+// occupies in the repo (compressed or not, including the encryption overhead).
+func (r *Repository) saveAndEncrypt(ctx context.Context, t rest.BlobType, data []byte, id rest.ID) (size int, err error) {
+	log.Infof("save id %v (%v, %d bytes)", id, t, len(data))
+
+	uncompressedLength := 0
+	if r.cfg.Version > 1 {
+
+		// we have a repo v2, so compression is available. if the user opts to
+		// not compress, we won't compress any data, but everything else is
+		// compressed.
+		if r.opts.Compression != CompressionOff || t != rest.DataBlob {
+			uncompressedLength = len(data)
+			data = r.getZstdEncoder().EncodeAll(data, nil)
+		}
+	}
+
+	nonce := crypto.NewRandomNonce()
+
+	ciphertext := make([]byte, 0, crypto.CiphertextLength(len(data)))
+	ciphertext = append(ciphertext, nonce...)
+
+	// encrypt blob
+	ciphertext = r.key.Seal(ciphertext, nonce, data, nil)
+
+	if err := r.verifyCiphertext(ciphertext, uncompressedLength, id); err != nil {
+		//nolint:revive // ignore linter warnings about error message spelling
+		return 0, fmt.Errorf("Detected data corruption while saving blob %v: %w\nCorrupted blobs are either caused by hardware issues or software bugs. Please open an issue at https://github.com/restic/restic/issues/new/choose for further troubleshooting.", id, err)
+	}
+
+	// find suitable packer and add blob
+	var pm *packerManager
+
+	switch t {
+	case rest.TreeBlob:
+		pm = r.treePM
+	case rest.DataBlob:
+		pm = r.dataPM
+	default:
+		panic(fmt.Sprintf("invalid type: %v", t))
+	}
+
+	return pm.SaveBlob(ctx, t, id, ciphertext, uncompressedLength)
+}
+
+func (r *Repository) verifyCiphertext(buf []byte, uncompressedLength int, id rest.ID) error {
+	if r.opts.NoExtraVerify {
+		return nil
+	}
+
+	nonce, ciphertext := buf[:r.key.NonceSize()], buf[r.key.NonceSize():]
+	plaintext, err := r.key.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return fmt.Errorf("decryption failed: %w", err)
+	}
+	if uncompressedLength != 0 {
+		// DecodeAll will allocate a slice if it is not large enough since it
+		// knows the decompressed size (because we're using EncodeAll)
+		plaintext, err = r.getZstdDecoder().DecodeAll(plaintext, nil)
+		if err != nil {
+			return fmt.Errorf("decompression failed: %w", err)
+		}
+	}
+	if !rest.Hash(plaintext).Equal(id) {
+		return errors.New("hash mismatch")
+	}
+
+	return nil
+}
+
+func (r *Repository) StartPackUploader(ctx context.Context, wg *errgroup.Group) {
+	if r.packerWg != nil {
+		panic("uploader already started")
+	}
+
+	innerWg, ctx := errgroup.WithContext(ctx)
+	r.packerWg = innerWg
+	r.uploader = newPackerUploader(ctx, innerWg, r, r.be.Connections())
+	r.treePM = newPackerManager(r.key, rest.TreeBlob, r.packSize(), r.uploader.QueuePacker)
+	r.dataPM = newPackerManager(r.key, rest.DataBlob, r.packSize(), r.uploader.QueuePacker)
+
+	wg.Go(func() error {
+		return innerWg.Wait()
+	})
+}
+
+// packSize return the target size of a pack file when uploading
+func (r *Repository) packSize() uint {
+	return r.opts.PackSize
 }

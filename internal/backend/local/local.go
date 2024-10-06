@@ -356,3 +356,9 @@ func (b *Local) Stat(_ context.Context, h backend.Handle) (backend.FileInfo, err
 
 	return backend.FileInfo{Size: fi.Size(), Name: h.Name}, nil
 }
+
+// Open opens the local backend as specified by config.
+func Open(ctx context.Context, cfg Config) (*Local, error) {
+	log.Infof("open local backend at %v (layout %q)", cfg.Path, cfg.Layout)
+	return open(ctx, cfg)
+}
